@@ -127,7 +127,7 @@ def reset(root, database="data/video_factory.db", media="data/media", *, runtime
     if database.is_relative_to(media):
         raise ValueError("The media directory overlaps the SQLite database.")
     targets = tuple(dict.fromkeys(
-        checked(root, path) for path in (media, database.parent / "schema_backups", data / "tmp",
+        checked(root, path) for path in (media, database.parent / "schema_backups", data / "tmp", data / "imports",
                                           root / "logs", root / "reports", *runtime_targets)
     ))
     identity_file = os.getenv("VIDEO_FACTORY_SECRET_KEY_FILE")

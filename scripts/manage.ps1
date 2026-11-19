@@ -41,5 +41,6 @@ try {
     $resetScript = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $PSScriptRoot 'reset_business_data.py')
     $resetScript | & docker compose -f compose.yaml run --rm --no-deps --pull never -T --entrypoint python backend -
     if ($LASTEXITCODE -ne 0) { throw "Business-data cleanup failed for $project. Check the previous output." }
+    Invoke-DockerChecked -DockerArguments @('compose', '-f', 'compose.yaml', 'rm', '-f', 'frontend', 'backend')
     Write-Output "Business-data cleanup complete for $project. Model configuration and named volumes retained."
 } finally { Pop-Location }

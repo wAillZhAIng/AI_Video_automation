@@ -372,7 +372,8 @@ jobs:
           import hashlib
           from pathlib import Path
           (Path('/app/data/media')).mkdir(parents=True, exist_ok=True)
-          for name in ['data/media', 'logs', 'reports']:
+          for name in ['data/media', 'data/imports', 'logs', 'reports']:
+              (Path('/app') / name).mkdir(parents=True, exist_ok=True)
               (Path('/app') / name / 'ci-volume-probe.txt').write_text('CI synthetic volume probe')
           (Path('/app/data') / 'ci-key-fingerprint.txt').write_text(
               hashlib.sha256(Path('/app/data/.secrets/master.key').read_bytes()).hexdigest())
@@ -400,7 +401,7 @@ jobs:
           PY
           docker compose --env-file /dev/null -f compose.dev.yaml exec -T backend python - <<'PY'
           from pathlib import Path
-          for name in ['data/media', 'logs', 'reports']:
+          for name in ['data/media', 'data/imports', 'logs', 'reports']:
               assert (Path('/app') / name / 'ci-volume-probe.txt').read_text() == 'CI synthetic volume probe'
           print('All three named volumes retained their probe files.')
           PY
@@ -412,7 +413,7 @@ jobs:
           export BACKEND_SOURCE_IMAGE="$BACKEND_DEV_IMAGE"
           bash scripts/manage.sh clean --yes
           test "$(docker volume ls -q --filter "label=com.docker.compose.project=$COMPOSE_PROJECT_NAME" | wc -l)" -eq 3
-          test -z "$(docker compose -f compose.dev.yaml ps --quiet)"
+          test -z "$(docker compose -f compose.dev.yaml ps --all --quiet)"
           docker compose --env-file /dev/null -f compose.dev.yaml up -d --no-build --pull never --wait --wait-timeout 180
           python - <<'PY'
           import json, pathlib, urllib.error, urllib.request
@@ -433,7 +434,7 @@ jobs:
           import hashlib, sqlite3
           from pathlib import Path
           from app.core.secrets import reveal
-          for name in ['data/media', 'logs', 'reports']:
+          for name in ['data/media', 'data/imports', 'logs', 'reports']:
               assert not (Path('/app') / name / 'ci-volume-probe.txt').exists()
           key_sha = hashlib.sha256(Path('/app/data/.secrets/master.key').read_bytes()).hexdigest()
           assert key_sha == Path('/app/data/ci-key-fingerprint.txt').read_text()

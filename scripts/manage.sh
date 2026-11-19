@@ -70,4 +70,5 @@ if [ -n "$containers" ]; then
   exit 1
 fi
 compose run --rm --no-deps --pull never -T --entrypoint python backend - < ./scripts/reset_business_data.py
+compose rm -f frontend backend
 echo "Business-data cleanup complete for $project. Model configuration and named volumes retained."
