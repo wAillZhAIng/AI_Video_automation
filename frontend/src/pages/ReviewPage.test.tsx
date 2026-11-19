@@ -210,12 +210,7 @@ it.each([
   ['postprocessing', { parameters_json: { revision_postprocess: { state: 'failed', error: { message: '修订原片已保存；SeedVR 处理失败' } } } }, '修订原片已保存；SeedVR 处理失败'],
 ] as const)('retains a terminal %s failure after polling and toast expiry without claiming a complete revision', async (_stage, failureFields, message) => {
   const expireToasts = captureToastExpiry();
-  let tick: (() => Promise<void>) | undefined;
-  vi.spyOn(window, 'setInterval').mockImplementation(((fn: () => Promise<void>, delay: number) => {
-    if (delay === 2500) tick = fn;
-    return 123;
-  }) as typeof window.setInterval);
-  vi.spyOn(window, 'clearInterval').mockImplementation(() => {});
+  const intervals = trackRevisionIntervals();
   const raw = { ...video, metadata_json: { ...video.metadata_json, revision_postprocess: { job_id: 'j1', state: 'processing' } } };
   const fetcher = vi.fn(async (url: string) => {
     const path = new URL(url, 'http://localhost').pathname;
@@ -228,9 +223,9 @@ it.each([
   vi.stubGlobal('fetch', fetcher);
   render(<MemoryRouter initialEntries={['/review?project=p1']}><ToastProvider><ReviewPage /></ToastProvider></MemoryRouter>);
   const instruction = await screen.findByLabelText('本次修改要求');
-  await waitFor(() => expect(tick).toBeDefined());
+  await waitFor(() => expect(intervals.size).toBe(1));
   const retainedInstruction = (instruction as HTMLTextAreaElement).value;
-  await act(async () => { await tick?.(); });
+  await act(async () => { await intervals.values().next().value?.(); });
   const failure = await screen.findByRole('alert', { name: '修订未完成' });
   await expireToasts();
   expect(screen.getByRole('region', { name: '操作通知' })).toBeEmptyDOMElement();
