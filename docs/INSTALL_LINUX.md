@@ -29,4 +29,4 @@ bash ./scripts/backup-docker.sh
 docker compose logs --tail=100 backend frontend
 ```
 
-一键清理会在确认后删除此 Compose 项目的三个数据卷及对应容器。从空白状态启用应用请再次启动。备份与恢复见 [Docker 维护教程](DOCKER_RELEASE_GUIDE_ZH.md)，制作步骤见 [Word 到 MP4 教程](USER_GUIDE_ZH.md)。
+一键清理会在确认后删除项目记录、上传文件、成片和运行日志，保留模型服务档案、密钥和系统制作设置。ComfyUI 与 Context-IR 在已配置的推理主机上启动。备份与恢复见 [Docker 维护教程](DOCKER_RELEASE_GUIDE_ZH.md)，制作步骤见 [Word 到 MP4 教程](USER_GUIDE_ZH.md)。

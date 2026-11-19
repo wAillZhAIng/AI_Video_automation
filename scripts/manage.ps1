@@ -32,15 +32,14 @@ try {
         return
     }
     if (-not $Yes) {
-        $answer = Read-Host "Permanently reset application records and volumes. Type $project to confirm"
+        $answer = Read-Host "Permanently clear $project business files and records (keep model settings). Type the project name to confirm"
         if ($answer -cne $project) { return }
     }
-    Invoke-DockerChecked -DockerArguments @('compose', '-f', 'compose.yaml', 'down', '--timeout', '5', '--volumes')
-    $remainingVolumes = & docker volume ls --quiet --filter "label=com.docker.compose.project=$project"
-    if ($LASTEXITCODE -ne 0) { throw "Could not check remaining volumes for $project." }
-    $remainingContainers = & docker compose -f compose.yaml ps --all --quiet
-    if ($LASTEXITCODE -ne 0 -or $remainingContainers -or $remainingVolumes) {
-        throw "Reset incomplete for $project. Check for a container using its volumes and retry."
-    }
-    Write-Output "Reset complete for $project. Start again to create empty volumes."
+    Invoke-DockerChecked -DockerArguments @('compose', '-f', 'compose.yaml', 'stop', '--timeout', '5')
+    $remaining = & docker compose -f compose.yaml ps --quiet
+    if ($LASTEXITCODE -ne 0 -or $remaining) { throw "Cleanup cancelled because containers in $project may still be running." }
+    $resetScript = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $PSScriptRoot 'reset_business_data.py')
+    $resetScript | & docker compose -f compose.yaml run --rm --no-deps --pull never -T --entrypoint python backend -
+    if ($LASTEXITCODE -ne 0) { throw "Business-data cleanup failed for $project. Check the previous output." }
+    Write-Output "Business-data cleanup complete for $project. Model configuration and named volumes retained."
 } finally { Pop-Location }

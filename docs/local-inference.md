@@ -101,6 +101,16 @@ py -3.10 -m venv C:\AI\envs\qwen
 
 ## 5. 启动 Comfy 和真实内存调度代理
 
+使用 Windows 管理器时，在项目 `.env` 设置 `VF_NATIVE_RUNTIME_CONFIG=C:/AI/VideoFactoryRuntime/native-runtime.json`，然后双击 `Windows管理.cmd` 选择一键启动。脚本会核对已有 ComfyUI 的目录、CUDA 和内存参数，并启动或复用 Context-IR。运行中的真实任务继续使用原服务。应用就绪后管理器打开浏览器。可在 `RuntimeRoot` 的 `logs/context-ir-launcher.log` 查看新的代理启动日志。
+
+也可在推理主机上单独启动这两个服务：
+
+```powershell
+& C:\AI\envs\comfy\Scripts\python.exe -B .\scripts\local_inference\start_stack.py --config C:\AI\VideoFactoryRuntime\native-runtime.json
+```
+
+需要单独查看两个进程时，可使用以下命令。
+
 ```powershell
 & C:\AI\envs\comfy\Scripts\python.exe -B .\scripts\local_inference\videofactory_native.py start-comfy --config C:\AI\VideoFactoryRuntime\native-runtime.json
 & C:\AI\envs\comfy\Scripts\python.exe -B .\scripts\local_inference\videofactory_native.py serve --config C:\AI\VideoFactoryRuntime\native-runtime.json

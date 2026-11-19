@@ -36,9 +36,11 @@ jobs:
           if ($manager.Extension -ne '.exe' -or $manager.Length -le 0) { throw 'Manager did not build' }
           $tokens = $null
           $errors = $null
-          $null = [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path ./scripts/manage.ps1),
-              [ref]$tokens, [ref]$errors)
-          if ($errors) { throw ($errors -join [Environment]::NewLine) }
+          foreach ($script in @('./scripts/manage.ps1', './scripts/start.ps1')) {
+            $null = [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $script),
+                [ref]$tokens, [ref]$errors)
+            if ($errors) { throw ($errors -join [Environment]::NewLine) }
+          }
       - name: Verify the Unix launchers and shared manager syntax
         if: runner.os != 'Windows'
         run: |
@@ -367,9 +369,13 @@ jobs:
       - name: Write isolated probes in all three persistent volumes
         run: |
           docker compose --env-file /dev/null -f compose.dev.yaml exec -T backend python - <<'PY'
+          import hashlib
           from pathlib import Path
-          for name in ['data', 'logs', 'reports']:
+          (Path('/app/data/media')).mkdir(parents=True, exist_ok=True)
+          for name in ['data/media', 'logs', 'reports']:
               (Path('/app') / name / 'ci-volume-probe.txt').write_text('CI synthetic volume probe')
+          (Path('/app/data') / 'ci-key-fingerprint.txt').write_text(
+              hashlib.sha256(Path('/app/data/.secrets/master.key').read_bytes()).hexdigest())
           PY
       - name: Recreate containers without deleting volumes
         run: docker compose --env-file /dev/null -f compose.dev.yaml up -d --no-build --pull never --force-recreate --wait --wait-timeout 180
@@ -394,18 +400,50 @@ jobs:
           PY
           docker compose --env-file /dev/null -f compose.dev.yaml exec -T backend python - <<'PY'
           from pathlib import Path
-          for name in ['data', 'logs', 'reports']:
+          for name in ['data/media', 'logs', 'reports']:
               assert (Path('/app') / name / 'ci-volume-probe.txt').read_text() == 'CI synthetic volume probe'
           print('All three named volumes retained their probe files.')
           PY
-      - name: Stop with the manager and verify its full reset of this test project
+      - name: Stop and clear business data through the manager
         run: |
           bash scripts/manage.sh stop
           test -z "$(docker compose -f compose.dev.yaml ps --quiet)"
           test "$(docker volume ls -q --filter "label=com.docker.compose.project=$COMPOSE_PROJECT_NAME" | wc -l)" -eq 3
+          export BACKEND_SOURCE_IMAGE="$BACKEND_DEV_IMAGE"
           bash scripts/manage.sh clean --yes
-          test -z "$(docker volume ls -q --filter "label=com.docker.compose.project=$COMPOSE_PROJECT_NAME")"
-          test -z "$(docker compose -f compose.dev.yaml ps --all --quiet)"
+          test "$(docker volume ls -q --filter "label=com.docker.compose.project=$COMPOSE_PROJECT_NAME" | wc -l)" -eq 3
+          test -z "$(docker compose -f compose.dev.yaml ps --quiet)"
+          docker compose --env-file /dev/null -f compose.dev.yaml up -d --no-build --pull never --wait --wait-timeout 180
+          python - <<'PY'
+          import json, pathlib, urllib.error, urllib.request
+          base = 'http://127.0.0.1:18083'
+          state = json.loads(pathlib.Path('/tmp/ci-persistence.json').read_text())
+          for path in ('/api/projects/' + state['project_id'], '/api/word-imports/' + state['import_id']):
+              try:
+                  urllib.request.urlopen(base + path, timeout=15).close()
+              except urllib.error.HTTPError as error:
+                  assert error.code == 404, error
+              else:
+                  raise AssertionError(f'Business record remains: {path}')
+          with urllib.request.urlopen(base + '/api/settings/ai-services', timeout=15) as response:
+              profile = next(item for item in json.load(response) if item['id'] == state['service_id'])
+              assert profile['has_api_key'] and 'ci-only-synthetic-token' not in json.dumps(profile)
+          PY
+          docker compose --env-file /dev/null -f compose.dev.yaml exec -T backend python - <<'PY'
+          import hashlib, sqlite3
+          from pathlib import Path
+          from app.core.secrets import reveal
+          for name in ['data/media', 'logs', 'reports']:
+              assert not (Path('/app') / name / 'ci-volume-probe.txt').exists()
+          key_sha = hashlib.sha256(Path('/app/data/.secrets/master.key').read_bytes()).hexdigest()
+          assert key_sha == Path('/app/data/ci-key-fingerprint.txt').read_text()
+          with sqlite3.connect('/app/data/video_factory.db') as connection:
+              encrypted = connection.execute(
+                  "SELECT encrypted_secret FROM ai_services WHERE name = ?", ('CI configuration-only profile',)
+              ).fetchone()[0]
+              assert reveal(encrypted) == 'ci-only-synthetic-token'
+          print('Project and uploads cleared. Named volumes and usable encrypted model credentials preserved.')
+          PY
       - name: Show status and key logs
         if: always()
         run: |

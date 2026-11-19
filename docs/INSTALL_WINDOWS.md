@@ -43,7 +43,9 @@ Start-Process 'http://127.0.0.1:8088'
 
 旧 GHCR 发行镜像可用 `docker compose -f compose.prebuilt.yaml up -d`，但旧镜像可能没有本次 Context-IR 更新；不要将其直接用于已升级的数据库。开发隔离环境使用 `compose.dev.yaml`，默认项目 `ai-video-automation-dev`、端口 `18088`。
 
-双击根目录的 `Windows管理.cmd` 可打开管理窗口。启动会自动打开网页，关闭会保留数据，清理会在确认后永久删除当前项目的数据卷。
+双击根目录的 `Windows管理.cmd` 可打开管理窗口。按[本地推理部署教程](local-inference.md)安装本机节点后，在 `.env` 设定 `VF_NATIVE_RUNTIME_CONFIG=C:/AI/VideoFactoryRuntime/native-runtime.json`。一键启动会启动或复用 ComfyUI 与 Context-IR，待应用就绪后打开网页。
+
+一键关闭会停止应用容器。一键清理在确认后删除业务记录、上传文件、成片和运行日志，并保留模型服务档案、密钥、模型工作流及系统制作设置。宿主机模型由自己的运行时管理。
 
 
 ## 4. 安装本地模型节点

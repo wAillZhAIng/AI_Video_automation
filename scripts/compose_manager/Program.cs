@@ -131,7 +131,7 @@ internal sealed class ManagerWindow : Form
         layout.Controls.Add(output, 0, 4);
         var help = new Label
         {
-            Text = "关闭会中断正在运行的任务。清理会永久移除此 Compose 项目的数据卷。",
+            Text = "关闭会中断正在运行的任务。清理业务数据会保留模型配置。",
             Dock = DockStyle.Fill, AutoSize = true, ForeColor = Muted, Margin = new Padding(0, 9, 0, 0),
         };
         layout.Controls.Add(help, 0, 5);
@@ -159,11 +159,11 @@ internal sealed class ManagerWindow : Form
     private bool ConfirmReset()
     {
         string message =
-            "清理会关闭此 Compose 项目，并永久删除项目历史、服务档案及密钥、上传与生成文件、成片和运行日志。"
+            "清理会关闭此 Compose 项目，并永久删除项目历史、上传与生成文件、成片和运行日志。"
             + Environment.NewLine + Environment.NewLine
-            + "再次启动会创建空的数据卷。若需要旧记录，请先备份。"
+            + "模型服务档案、密钥、已安装模型和系统制作设置会保留。"
             + Environment.NewLine + Environment.NewLine + "确认清理此目录所配置的 Compose 项目？";
-        return MessageBox.Show(this, message, "确认恢复全新状态",
+        return MessageBox.Show(this, message, "确认清理业务数据",
             MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) == DialogResult.Yes;
     }
 
@@ -182,7 +182,7 @@ internal sealed class ManagerWindow : Form
         }
         var operation = new Operation(action);
         active = operation;
-        status.Text = action == "start" ? "正在启动…" : action == "stop" ? "正在关闭…" : "正在恢复全新状态…";
+        status.Text = action == "start" ? "正在启动…" : action == "stop" ? "正在关闭…" : "正在清理业务数据…";
         Append("");
         Append(status.Text);
         UpdateActions();
@@ -318,7 +318,7 @@ internal sealed class ManagerWindow : Form
             return;
         }
         if (exitCode == 0)
-            status.Text = operation.Action == "start" ? "服务已就绪" : operation.Action == "stop" ? "已关闭" : "已恢复全新状态";
+            status.Text = operation.Action == "start" ? "服务已就绪" : operation.Action == "stop" ? "已关闭" : "已清理业务数据";
         else
             status.Text = "操作未完成，请查看日志";
         UpdateActions();

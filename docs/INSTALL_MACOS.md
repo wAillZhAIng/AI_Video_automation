@@ -51,7 +51,7 @@ open http://127.0.0.1:8088
 
 Mac Docker 不会获得 Windows CUDA、宿主 Apple Metal/MPS 或原生 Windows 启动器。CosyVoice、IndexTTS、SeedVR2 等也必须使用本项目实际支持的运行方式；任意 HTTP 地址不等于已有对应远程适配器。
 
-双击根目录的 `macOS管理.command` 可打开三项管理菜单。若解压后没有执行权限，在终端运行 `bash ./macOS管理.command`。启动会自动打开网页，关闭会保留数据，清理会在确认后永久删除当前项目的数据卷。
+双击根目录的 `macOS管理.command` 可打开三项管理菜单。若解压后没有执行权限，在终端运行 `bash ./macOS管理.command`。启动会自动打开网页，关闭会保留数据。清理会在确认后删除项目记录、上传文件、成片和运行日志，保留模型服务档案、密钥和系统制作设置。ComfyUI 与 Context-IR 在已配置的推理主机上启动。
 
 
 ## 4. 云端 API 与第一条小样

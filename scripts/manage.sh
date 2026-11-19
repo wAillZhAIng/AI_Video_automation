@@ -49,25 +49,25 @@ if [ "$action" = stop ]; then
   exit 0
 fi
 if [ "$option" != '--yes' ]; then
-  printf '永久清除 %s 的项目记录、服务档案与密钥、素材、成片和运行日志。\n' "$project"
+  printf '永久清除 %s 的项目记录、素材、成片和运行日志。保留模型服务档案和密钥。\n' "$project"
   if [ "$(uname -s)" = Darwin ] && [ "$#" -eq 0 ]; then
     osascript - "$project" <<'APPLESCRIPT' >/dev/null || exit 0
 on run argv
-  display dialog ("永久清除 " & item 1 of argv & " 的项目记录、服务档案与密钥、素材、成片和运行日志？") with title "确认恢复全新状态" buttons {"取消", "永久清理"} default button "取消" cancel button "取消" with icon caution
+  display dialog ("永久清除 " & item 1 of argv & " 的项目记录、素材、成片和运行日志？模型服务档案和密钥会保留。") with title "确认清理业务数据" buttons {"取消", "永久清理"} default button "取消" cancel button "取消" with icon caution
 end run
 APPLESCRIPT
   elif [ "$#" -eq 0 ] && command -v zenity >/dev/null && { [ -n "${DISPLAY:-}" ] || [ -n "${WAYLAND_DISPLAY:-}" ]; }; then
-    zenity --question --title='确认恢复全新状态' --text="永久清除 $project 的项目记录、服务档案与密钥、素材、成片和运行日志？" --default-cancel || exit 0
+    zenity --question --title='确认清理业务数据' --text="永久清除 $project 的项目记录、素材、成片和运行日志？模型服务档案和密钥会保留。" --default-cancel || exit 0
   else
     read -r -p 'Type the Compose project name to confirm: ' answer || exit 0
     [ "$answer" = "$project" ] || exit 0
   fi
 fi
-compose down --timeout 5 --volumes
-remaining="$(docker volume ls --quiet --filter "label=com.docker.compose.project=$project")"
-containers="$(compose ps --all --quiet)"
-if [ -n "$remaining" ] || [ -n "$containers" ]; then
-  echo "Reset incomplete for $project. Check for a container using its volumes and retry." >&2
+compose stop --timeout 5
+containers="$(compose ps --quiet)"
+if [ -n "$containers" ]; then
+  echo "Cleanup cancelled because containers in $project are still running." >&2
   exit 1
 fi
-echo "Reset complete for $project. Start again to create empty volumes."
+compose run --rm --no-deps --pull never -T --entrypoint python backend - < ./scripts/reset_business_data.py
+echo "Business-data cleanup complete for $project. Model configuration and named volumes retained."
