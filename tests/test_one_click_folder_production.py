@@ -139,6 +139,77 @@ def test_quality_preflight_checks_only_the_selected_processing_plan() -> None:
     assert launcher.quality_supported(FakeApi(seed_capabilities), seed_quality)[0] is True
 
 
+def test_generation_preflight_requires_local_context_ir_and_exact_mode_steps() -> None:
+    class FakeApi:
+        def __init__(self, health, steps=4):
+            self.health = health
+            self.steps = steps
+
+        def get(self, path: str):
+            if path == "/api/providers/h3/context-health": return self.health
+            if path == "/api/quality/capabilities": return {"modes": {"fast": {"steps": self.steps}}}
+            raise AssertionError(path)
+
+    quality = {"mode": "fast"}
+    healthy = {"provider": "comfyui_h3_context_ir", "mode": "real", "ready": True,
+        "reference_to_video_available": True}
+    assert launcher.generation_supported(FakeApi(healthy), quality)[0] is True
+    assert launcher.generation_supported(FakeApi({**healthy, "ready": False}), quality)[0] is False
+    assert launcher.generation_supported(FakeApi(healthy, steps=20), quality)[0] is False
+
+
+def test_submit_candidate_blocks_before_word_import_when_context_ir_is_unready(tmp_path: Path) -> None:
+    class FakeApi:
+        def get(self, path: str):
+            if path == "/api/providers/h3/context-health":
+                return {"provider": "comfyui_h3_context_ir", "mode": "real", "ready": False,
+                    "reference_to_video_available": False}
+            if path == "/api/quality/capabilities": return {"modes": {"fast": {"steps": 4}}}
+            raise AssertionError(path)
+
+    candidate = launcher.Candidate(
+        path=tmp_path / "script.docx", relative_path="product/script.docx",
+        sha256="a" * 64, size=1, text="9:16", product_match=True,
+    )
+    with pytest.raises(launcher.WorkflowError, match="Context-IR/H3"):
+        launcher.submit_candidate(FakeApi(), candidate, quality={"mode": "fast", "aspect_ratio": "9:16"},
+            product_name=None, brand=None)
+
+
+@pytest.mark.parametrize(
+    ("run_status", "auto_status", "expected"),
+    [("completed", "generated", "finished"), ("completed_with_errors", "generated", "failed"),
+     ("completed", "failed", "failed"), ("waiting_review", "generated", "blocked")],
+)
+def test_resuming_a_known_run_never_resubmits_and_classifies_terminal_state(
+    run_status: str, auto_status: str, expected: str,
+) -> None:
+    class FakeApi:
+        def get(self, path: str):
+            assert path == "/api/studio/projects/project-1"
+            return {"run": {"id": "run-1", "status": run_status,
+                    "result_json": {"automatic_final": {"status": auto_status}}},
+                "shots": [{"video": {"id": "video-1"}}], "renders": [], "exceptions": []}
+
+    result = launcher.poll_existing_run(FakeApi(), "project-1", "run-1")
+    assert result["status"] == expected
+    assert result["resumed_without_resubmitting"] is True
+    assert result["videos"] == [{"id": "video-1"}]
+
+
+def test_screenplay_aspect_ratio_and_context_canvas_are_preserved(tmp_path: Path) -> None:
+    assert launcher.resolve_aspect_ratio("时间轴 00:00-00:09；严格锁定 9:16 竖屏（1080x1920）") == "9:16"
+    assert launcher.resolve_aspect_ratio("输出尺寸 1080×1920") == "9:16"
+    assert launcher.resolve_aspect_ratio("没有画幅说明") == "16:9"
+    assert launcher.resolve_aspect_ratio("剧本写 9:16，但我明确覆盖为横屏", "16:9") == "16:9"
+    with pytest.raises(launcher.WorkflowError, match="互相冲突"):
+        launcher.resolve_aspect_ratio("成片 9:16，另一个规格写 16:9")
+
+    assert launcher.context_native_canvas("9:16") == (576, 1024)
+    assert launcher.context_native_canvas("16:9") == (1024, 576)
+    assert launcher.context_native_canvas("1:1") == (768, 768)
+
+
 def test_batch_continues_after_failure_and_skips_already_dispatched(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     root = tmp_path / "scripts"
     _write_docx(root / "a.docx")
@@ -152,9 +223,13 @@ def test_batch_continues_after_failure_and_skips_already_dispatched(tmp_path: Pa
 
         def get(self, path: str):
             if path == "/api/health": return {"status": "ok"}
+            if path == "/api/providers/h3/context-health":
+                return {"provider": "comfyui_h3_context_ir", "mode": "real", "ready": True,
+                    "reference_to_video_available": True}
             if path == "/api/quality/capabilities":
                 return {"ai_plans": [{"requested": {"resolution": "4k", "aspect_ratio": "16:9"},
-                    "supported": True, "ai_super_resolution": True, "postprocess_model": {"name": "RealESRGAN_x4plus"}}]}
+                    "supported": True, "ai_super_resolution": True, "postprocess_model": {"name": "RealESRGAN_x4plus"}}],
+                    "modes": {"fast": {"steps": 4}}}
             return {"items": []}
 
     submitted: list[str] = []

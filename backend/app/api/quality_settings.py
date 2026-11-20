@@ -30,6 +30,8 @@ def capabilities(request:Request,session:Session=Depends(get_db)):
     from app.services.super_resolution import status
     sr=status(request.app.state.settings)
     seed=seedvr_capabilities(session,request.app.state.settings)
+    targets=[(resolution,aspect_ratio) for resolution in ('720p','1080p','2k','4k')
+             for aspect_ratio in ('16:9','9:16','1:1')]
     evidence=[]
     for video in session.scalars(select(m.VideoRevision).order_by(m.VideoRevision.created_at.desc())):
         job=session.get(m.GenerationJob,video.generation_job_id)
@@ -38,9 +40,9 @@ def capabilities(request:Request,session:Session=Depends(get_db)):
                 'service_id':job.parameters_json.get('service_snapshot',{}).get('service_id'),'service_revision':job.parameters_json.get('service_snapshot',{}).get('service_revision'),
                 'workflow':job.workflow_version,'width':video.metadata_json.get('width'),'height':video.metadata_json.get('height'),
                 'steps':job.parameters_json.get('steps'),'evidence_type':'existing_decoded_generation_output'})
-    return {'plans':[plan(QualitySettings(resolution=r),sr) for r in ['720p','1080p','2k','4k']],
-        'ai_plans':[plan(QualitySettings(resolution=r,processing='ai_super_resolution'),sr) for r in ['720p','1080p','2k','4k']],
-        'seedvr2_plans':[plan(QualitySettings(resolution=r,processing='seedvr2'),sr,seed) for r in ['720p','1080p','2k','4k']],
+    return {'plans':[plan(QualitySettings(resolution=r,aspect_ratio=a),sr) for r,a in targets],
+        'ai_plans':[plan(QualitySettings(resolution=r,aspect_ratio=a,processing='ai_super_resolution'),sr) for r,a in targets],
+        'seedvr2_plans':[plan(QualitySettings(resolution=r,aspect_ratio=a,processing='seedvr2'),sr,seed) for r,a in targets],
         'modes':{name:{**mapping,'verification':'参数映射已接入；须按具体模型、服务和工作流核对实测证据',
             'model_specific_verification':[e for e in evidence if e['steps']==mapping['steps']][:20]} for name,mapping in MODES.items()},
         'native_evidence':evidence[:40],'ai_super_resolution':sr,'seedvr2':seed,'reconstruction':{'state':'not_configured'}}

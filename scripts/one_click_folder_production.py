@@ -5,7 +5,7 @@ Default behavior is a read-only dry run. A real run requires an explicit file
 selection plus --submit --confirm-submit, or the interactive SUBMIT confirmation.
 """
 from __future__ import annotations
-import argparse, hashlib, json, mimetypes, os, sys, time, uuid, zipfile
+import argparse, hashlib, json, math, mimetypes, os, re, sys, time, uuid, zipfile
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -22,6 +22,7 @@ IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
 DOCX_MAX_BYTES = 64 * 1024 * 1024
 IMAGE_MAX_BYTES = 10 * 1024 * 1024
 QUALITY = {"resolution": "4k", "mode": "fast", "processing": "ai_super_resolution", "aspect_ratio": "16:9"}
+SUPPORTED_ASPECT_RATIOS = ("16:9", "9:16", "1:1")
 PROCESSING_PLANS = {
     "lanczos": ("plans", "普通缩放"),
     "ai_super_resolution": ("ai_plans", "Real-ESRGAN 本机 AI 超分"),
@@ -134,6 +135,45 @@ def product_identity(candidate: Candidate, *, product_name: str | None = None, b
         resolved_name = group or candidate.path.stem
     resolved_brand = brand.strip() if brand and brand.strip() else ("Owala" if "owala" in haystack and "freesip" in haystack else "")
     return resolved_name[:200], resolved_brand[:200]
+
+def resolve_aspect_ratio(text: str, requested: str = "auto") -> str:
+    """Use an explicit CLI override or preserve the ratio stated in the screenplay."""
+    if requested != "auto":
+        if requested not in SUPPORTED_ASPECT_RATIOS:
+            raise WorkflowError(f"不支持的画幅：{requested}", phase="quality")
+        return requested
+    ratios = set()
+    for value in re.findall(r"(?<!\d)(16\s*[:：]\s*9|9\s*[:：]\s*16|1\s*[:：]\s*1)(?!\d)", text):
+        left, right = (int(part.strip()) for part in re.split(r"[:：]", value))
+        ratios.add(f"{left}:{right}")
+    # Dimensions are a fallback when the screenplay gives pixels but no ratio.
+    if not ratios:
+        dimensions = re.findall(r"(?<!\d)(\d{3,5})\s*[xX×]\s*(\d{3,5})(?!\d)", text)
+        for width, height in dimensions:
+            divisor = math.gcd(int(width), int(height))
+            ratio = f"{int(width) // divisor}:{int(height) // divisor}"
+            if ratio in SUPPORTED_ASPECT_RATIOS:
+                ratios.add(ratio)
+    if len(ratios) > 1:
+        raise WorkflowError("剧本包含互相冲突的输出画幅，未导入或提交：" + ", ".join(sorted(ratios)), phase="quality")
+    return next(iter(ratios), QUALITY["aspect_ratio"])
+
+def quality_for_candidate(candidate: Candidate, *, resolution: str, mode: str, processing: str,
+                          requested_aspect_ratio: str = "auto") -> dict[str, str]:
+    return {"resolution": resolution, "mode": mode, "processing": processing,
+        "aspect_ratio": resolve_aspect_ratio(candidate.text, requested_aspect_ratio)}
+
+def context_native_canvas(aspect_ratio: str, megapixels: float = 0.59) -> tuple[int, int]:
+    """Match the H3 Context-IR 32-pixel grid at the selected portrait/landscape ratio."""
+    if aspect_ratio not in SUPPORTED_ASPECT_RATIOS:
+        raise WorkflowError(f"Context-IR 不支持画幅 {aspect_ratio}", phase="quality")
+    width_ratio, height_ratio = (int(part) for part in aspect_ratio.split(":"))
+    ratio = width_ratio / height_ratio
+    pixels = round(megapixels * 1_000_000, 2)
+    native_height = math.sqrt(pixels / ratio)
+    width = max(32, round(native_height * ratio / 32) * 32)
+    height = max(32, round(native_height / 32) * 32)
+    return width, height
 
 def _image_files(directory: Path) -> Iterable[Path]:
     try: entries = sorted(directory.iterdir(), key=lambda p: p.name.casefold())
@@ -291,6 +331,23 @@ def quality_supported(api: Api, quality: dict[str, str]) -> tuple[bool, dict[str
         return supported, evidence
     return False, {"supported": False, "reason": f"服务未返回 {label} 的 {resolution} · {ratio} 验收能力", "capability_count": len(plans)}
 
+def generation_supported(api: Api, quality: dict[str, str]) -> tuple[bool, dict[str, Any]]:
+    """Require the active local Context-IR route and the requested sampler mapping."""
+    health = api.get("/api/providers/h3/context-health")
+    expected_steps = {"preview": 12, "standard": 20, "fast": 4, "high": 30}.get(quality.get("mode"))
+    capabilities = api.get("/api/quality/capabilities")
+    mode = capabilities.get("modes", {}).get(quality.get("mode"), {}) if isinstance(capabilities, dict) else {}
+    steps = mode.get("steps") if isinstance(mode, dict) else None
+    result = {"health": health, "mode": quality.get("mode"), "steps": steps,
+              "expected_steps": expected_steps, "workflow_route": "local Context-IR"}
+    ready = (isinstance(health, dict) and health.get("provider") == "comfyui_h3_context_ir"
+        and health.get("mode") == "real" and health.get("ready") is True
+        and health.get("reference_to_video_available") is True
+        and expected_steps is not None and steps == expected_steps)
+    if not ready:
+        result["reason"] = "本机 Context-IR 视频路由未就绪，或画质档位没有匹配的采样步数映射"
+    return ready, result
+
 def product_lookup(api: Api, name: str, brand: str) -> list[dict[str, Any]]:
     response = api.get("/api/product-library?q=" + quote(name)); items = response.get("items", []) if isinstance(response, dict) else []
     return [item for item in items if str(item.get("name", "")).casefold() == name.casefold()
@@ -309,6 +366,14 @@ def dry_run_plan(candidate: Candidate, api: Api | None, quality: dict[str, str],
     if api is None: result["api"] = {"reachable": False, "reason": "未执行 API 只读预检"}; return result
     try: result["api"] = {"reachable": True, "health": api.get("/api/health")}
     except WorkflowError as exc: result["api"] = {"reachable": False, "reason": str(exc)}; return result
+    try:
+        ready, evidence = generation_supported(api, quality)
+        result["generation_preflight"] = {"ready": ready, "evidence": evidence}
+        if not ready:
+            result.setdefault("blockers", []).append("本机 Context-IR/H3 工作流未就绪，未创建项目或提交模型")
+    except WorkflowError as exc:
+        result["generation_preflight"] = {"ready": False, "error": str(exc)}
+        result.setdefault("blockers", []).append("无法核验本机 Context-IR/H3 工作流，未创建项目或提交模型")
     try:
         supported, evidence = quality_supported(api, quality); result["quality_preflight"] = {"supported": supported, "evidence": evidence}
         if not supported: result.setdefault("blockers", []).append("本机超分处理方式、画幅和分辨率尚无匹配验收能力；真实提交前阻断，不创建项目或任务")
@@ -356,12 +421,50 @@ def ensure_product(api: Api, candidate: Candidate, *, product_name: str, brand: 
 def _project_has_run(overview: dict[str, Any]) -> tuple[bool, dict[str, Any] | None]:
     run = overview.get("run") if isinstance(overview, dict) else None; return bool(run and run.get("id")), run
 
+def poll_existing_run(api: Api, project_id: str, run_id: str, *, wait: bool = False,
+                     poll_seconds: float = 5, wait_seconds: float = 7200) -> dict[str, Any]:
+    """Resume observation of a known run without importing or submitting it again."""
+    deadline = time.monotonic() + wait_seconds
+    while True:
+        view = api.get(f"/api/studio/projects/{quote(project_id, safe='')}")
+        current = view.get("run") or {}
+        if current.get("id") != run_id:
+            raise WorkflowError("项目 run ID 已变化；停止恢复轮询", phase="poll", details=current)
+        auto = (current.get("result_json") or {}).get("automatic_final") or {}
+        auto_status = auto.get("status")
+        run_status = current.get("status")
+        terminal = run_status in {"completed", "completed_with_errors", "cancelled", "waiting_review"}
+        if terminal and auto_status in {"generated", "failed", "blocked", "cancelled", "completed"}:
+            videos = [x.get("video") for x in view.get("shots", []) if x.get("video")]
+            renders = view.get("renders", [])
+            exceptions = view.get("exceptions", [])
+            failed = auto_status in {"failed", "blocked", "cancelled"} or run_status in {"completed_with_errors", "cancelled", "waiting_review"} or bool(exceptions)
+            status = ("cancelled" if auto_status == "cancelled" or run_status == "cancelled"
+                      else "blocked" if auto_status == "blocked" or run_status == "waiting_review"
+                      else "failed" if failed else "finished")
+            return {"status": status, "project_id": project_id, "run_id": run_id,
+                "run_status": run_status, "automatic_final": auto, "videos": videos,
+                "renders": renders, "exceptions": exceptions,
+                "resumed_without_resubmitting": True}
+        if not wait:
+            return {"status": "still_running", "project_id": project_id, "run_id": run_id,
+                "run_status": run_status, "automatic_final": auto,
+                "resumed_without_resubmitting": True}
+        if time.monotonic() >= deadline:
+            return {"status": "still_running_or_wait_timeout", "project_id": project_id,
+                "run_id": run_id, "run_status": run_status, "automatic_final": auto,
+                "resumed_without_resubmitting": True}
+        time.sleep(poll_seconds)
+
 def submit_candidate(api: Api, candidate: Candidate, *, quality: dict[str, str], product_name: str | None, brand: str | None,
                      wait: bool = False, poll_seconds: float = 5, wait_seconds: float = 7200,
                      progress: Callable[[str, dict[str, Any]], None] | None = None) -> dict[str, Any]:
     resolved_name, resolved_brand = product_identity(candidate, product_name=product_name, brand=brand)
     if len(candidate.images) > 8: raise WorkflowError("同一产品组图片超过 8 张；未导入 Word 或提交模型", phase="preflight",
         details={"image_count": len(candidate.images), "maximum": 8})
+    ready, generation = generation_supported(api, quality)
+    if not ready:
+        raise WorkflowError("本机 Context-IR/H3 工作流未就绪，未导入 Word 或提交模型", phase="preflight", details=generation)
     supported, capability = quality_supported(api, quality)
     if not supported: raise WorkflowError("所选本机画质处理规格未验证，未导入 Word 或提交模型", phase="preflight", details=capability)
     if candidate.product_match and not candidate.images: raise WorkflowError("脚本匹配产品但无有效同目录产品图，未导入或提交", phase="preflight")
@@ -389,7 +492,8 @@ def submit_candidate(api: Api, candidate: Candidate, *, quality: dict[str, str],
         outcome = {"status": "existing_run_preserved", "project_id": project_id, "run": old_run, "message": "检测到已有制作记录；为避免重复派发，本次未再次启动"}
         if progress: progress("existing_run_preserved", {"project_id": project_id, "run": old_run})
         return outcome
-    payload = {"quality": quality, "width": 1024, "height": 576, "automatic_draft_assembly": False,
+    width, height = context_native_canvas(quality["aspect_ratio"])
+    payload = {"quality": quality, "width": width, "height": height, "automatic_draft_assembly": False,
         "automatic_final_assembly": True, "allow_cloud_costs": False, "allow_paid_fallback": False}
     if product_plan: payload["product_reference_plan"] = product_plan
     if progress: progress("start_pending", {"project_id": project_id})
@@ -399,19 +503,10 @@ def submit_candidate(api: Api, candidate: Candidate, *, quality: dict[str, str],
         "product_image_ids": image_ids, "shot_count": len(shot_ids), "quality": quality, "run_status": run.get("status")}
     if progress: progress("started", {"project_id": project_id, "run_id": run["id"], "run_status": run.get("status")})
     if wait:
-        deadline = time.monotonic() + wait_seconds
-        while time.monotonic() < deadline:
-            view = api.get(f"/api/studio/projects/{quote(project_id, safe='')}"); current = view.get("run") or {}
-            auto = (current.get("result_json") or {}).get("automatic_final") or {}
-            if current.get("id") != run["id"]: raise WorkflowError("项目 run ID 已变化；停止轮询", phase="poll", details=current)
-            if current.get("status") in {"completed", "completed_with_errors", "cancelled", "waiting_review"} and auto.get("status") in {"generated", "failed", "blocked", "cancelled", "completed"}:
-                outcome.update({"status": "finished", "run_status": current.get("status"), "automatic_final": auto,
-                    "videos": [x.get("video") for x in view.get("shots", []) if x.get("video")], "renders": view.get("renders", []), "exceptions": view.get("exceptions", [])})
-                if progress: progress("finished", {"project_id": project_id, "run_id": run["id"], "run_status": current.get("status"), "video_count": len(outcome["videos"])})
-                return outcome
-            time.sleep(poll_seconds)
-        outcome.update(status="still_running_or_wait_timeout", message="轮询超时；任务保留在应用中，未再次提交")
-        if progress: progress("still_running", {"project_id": project_id, "run_id": run["id"], "run_status": outcome.get("run_status")})
+        outcome.update(poll_existing_run(api, project_id, run["id"], wait=True,
+            poll_seconds=poll_seconds, wait_seconds=wait_seconds))
+        if progress: progress(outcome["status"], {"project_id": project_id, "run_id": run["id"],
+            "run_status": outcome.get("run_status"), "video_count": len(outcome.get("videos", []))})
     return outcome
 
 def resolve_selection(candidates: list[Candidate], selectors: list[str], *, limit: int) -> list[Candidate]:
@@ -456,7 +551,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--resolution", choices=("720p", "1080p", "2k", "4k"), default=QUALITY["resolution"])
     parser.add_argument("--mode", choices=("high", "standard", "fast", "preview"), default=QUALITY["mode"])
     parser.add_argument("--processing", choices=("lanczos", "native", "ai_super_resolution", "seedvr2", "reconstruction"), default=QUALITY["processing"])
-    parser.add_argument("--aspect-ratio", choices=("16:9", "9:16", "1:1"), default=QUALITY["aspect_ratio"])
+    parser.add_argument("--aspect-ratio", choices=("auto", "16:9", "9:16", "1:1"), default="auto",
+        help="默认从每份 Word 解析；未标注时回退到 16:9")
     parser.add_argument("--dry-run", action="store_true"); parser.add_argument("--submit", action="store_true")
     parser.add_argument("--confirm-submit", action="store_true"); parser.add_argument("--wait", action="store_true")
     parser.add_argument("--continue-on-error", action="store_true", help="批量任务中隔离失败项并继续其余文件")
@@ -483,9 +579,11 @@ def main(argv: list[str] | None = None) -> int:
         elif args.file: selected = resolve_selection(found.candidates, args.file, limit=args.limit)
         elif args.submit: raise WorkflowError("真实提交必须使用 --all、--file 或 --interactive 明确选择", phase="selection")
         else: selected = found.candidates[:1]; print("未选文件：只展示排序最前候选；真实批量提交请使用 --all。")
-        quality = {"resolution": args.resolution, "mode": args.mode, "processing": args.processing, "aspect_ratio": args.aspect_ratio}
+        qualities = [quality_for_candidate(item, resolution=args.resolution, mode=args.mode,
+            processing=args.processing, requested_aspect_ratio=args.aspect_ratio) for item in selected]
         api = Api(args.api, args.timeout)
-        plans = [dry_run_plan(item, api, quality, args.product_name, args.brand) for item in selected]
+        plans = [dry_run_plan(item, api, quality, args.product_name, args.brand)
+            for item, quality in zip(selected, qualities)]
         print_json({"selected_count": len(selected), "limit": args.limit, "mode": "all" if args.all_files else "selected", "plans": plans, "rejected_word_files": found.rejected,
             "note": "默认只读；所选本机处理方式没有对应画幅与分辨率的 capability supported=true 时，不会开始导入或生成。"})
         should_submit = args.submit
@@ -494,15 +592,41 @@ def main(argv: list[str] | None = None) -> int:
         if not should_submit: print("Dry-run 完成：没有写数据库、上传产品图或提交模型任务。"); return 0
         outcomes: list[dict[str, Any]] = []; continue_on_error = args.continue_on_error or args.all_files
         with RunLedger(args.state_file) as ledger:
-            for candidate, plan in zip(selected, plans):
+            for candidate, plan, quality in zip(selected, plans, qualities):
                 key = candidate_fingerprint(candidate, quality, api); previous = ledger.get(key)
                 if previous:
                     safe_retry = args.retry_failed and previous.get("status") == "preflight_failed"
                     if not safe_retry:
                         previous_status = previous.get("status")
-                        preserved_status = "duplicate_prevented" if previous_status in {"started", "finished", "existing_run_preserved", "still_running", "still_running_or_wait_timeout"} else "manual_check_required"
-                        item = {"status": preserved_status, "script": candidate.relative_path,
-                            "previous_status": previous.get("status"), "project_id": previous.get("project_id"), "run_id": previous.get("run_id")}
+                        project_id = previous.get("project_id")
+                        run_id = previous.get("run_id")
+                        resumable = previous_status in {"started", "still_running", "still_running_or_wait_timeout"}
+                        uncertain_with_project = previous_status in {"unknown", "start_pending"} and project_id
+                        if uncertain_with_project and not run_id:
+                            try:
+                                overview = api.get(f"/api/studio/projects/{quote(project_id, safe='')}")
+                                has_run, observed_run = _project_has_run(overview)
+                                if has_run:
+                                    run_id = observed_run.get("id")
+                                    resumable = True
+                            except WorkflowError:
+                                pass
+                        if resumable and project_id and run_id:
+                            try:
+                                item = poll_existing_run(api, project_id, run_id, wait=args.wait,
+                                    poll_seconds=args.poll_seconds, wait_seconds=args.wait_seconds)
+                                item["script"] = candidate.relative_path
+                                ledger.record(key, {**previous, **item, "stage": item["status"]})
+                            except WorkflowError as exc:
+                                item = {"status": "manual_check_required", "script": candidate.relative_path,
+                                    "previous_status": previous_status, "project_id": project_id, "run_id": run_id,
+                                    "error": str(exc), "phase": exc.phase, "details": exc.details}
+                                ledger.record(key, {**previous, **item, "stage": "resume_check"})
+                        else:
+                            preserved_status = "duplicate_prevented" if previous_status in {"finished", "existing_run_preserved", "duplicate_prevented"} else "manual_check_required"
+                            item = {"status": preserved_status, "script": candidate.relative_path,
+                                "previous_status": previous_status, "project_id": project_id, "run_id": run_id,
+                                "message": "已有未知或失败状态；为避免重复派发，未重新导入或提交。" if preserved_status == "manual_check_required" else None}
                         print_json(item); outcomes.append(item); continue
                 if not plan.get("api", {}).get("reachable"):
                     item = {"status": "blocked", "script": candidate.relative_path, "reason": plan.get("api", {}).get("reason", "服务不可达")}
@@ -515,12 +639,13 @@ def main(argv: list[str] | None = None) -> int:
                     if not continue_on_error: break
                     continue
                 current: dict[str, Any] = {"stage": "preflight"}
-                def progress(stage: str, details: dict[str, Any], *, _key: str = key, _candidate: Candidate = candidate) -> None:
+                def progress(stage: str, details: dict[str, Any], *, _key: str = key,
+                             _candidate: Candidate = candidate, _quality: dict[str, str] = quality) -> None:
                     current.update(details); current["stage"] = stage; current["status"] = stage
                     current["script"] = _candidate.relative_path
                     current["script_sha256"] = _candidate.sha256
                     current["image_sha256"] = sorted(asset.sha256 for asset in _candidate.images)
-                    current["quality"] = quality; current["api"] = api_fingerprint(api.base)
+                    current["quality"] = _quality; current["api"] = api_fingerprint(api.base)
                     ledger.record(_key, current)
                 try:
                     outcome = submit_candidate(api, candidate, quality=quality, product_name=args.product_name, brand=args.brand,

@@ -96,6 +96,39 @@ def test_profile_api_rejects_scope_confusion_and_unverified_super_resolution(cli
     assert response.status_code==409 and response.json()['error']['code']=='quality_method_unverified'
     assert client.get('/api/quality/profiles/project/not-real').status_code==404
 
+
+def test_quality_capability_matrix_includes_verified_portrait_super_resolution(client,monkeypatch):
+    from app.api import quality_settings
+    from app.services import super_resolution
+
+    model='realesr-general-x4v3'
+    monkeypatch.setattr(super_resolution,'status',lambda _settings:{
+        'state':'verified','model':'RealESRGAN_x4plus','verified_resolutions':['4k'],
+        'verified_aspect_ratios':['16:9','9:16'],
+        'model_by_aspect_ratio':{'16:9':'RealESRGAN_x4plus','9:16':model},
+    })
+    monkeypatch.setattr(quality_settings,'seedvr_capabilities',lambda _session,_settings:{'state':'unavailable'})
+
+    response=client.get('/api/quality/capabilities')
+    assert response.status_code==200,response.text
+    body=response.json()
+    expected={(resolution,aspect) for resolution in ('720p','1080p','2k','4k')
+              for aspect in ('16:9','9:16','1:1')}
+    for plan_key in ('plans','ai_plans','seedvr2_plans'):
+        plans=body[plan_key]
+        assert {(item['requested']['resolution'],item['requested']['aspect_ratio']) for item in plans}==expected
+
+    vertical=next(item for item in body['ai_plans']
+                  if item['requested']['resolution']=='4k' and item['requested']['aspect_ratio']=='9:16')
+    assert vertical['supported'] is True
+    assert vertical['ai_super_resolution'] is True
+    assert vertical['requested']['width']==2160 and vertical['requested']['height']==3840
+    assert vertical['postprocess_model']['name']==model
+
+    square=next(item for item in body['ai_plans']
+                if item['requested']['resolution']=='4k' and item['requested']['aspect_ratio']=='1:1')
+    assert square['supported'] is False
+
 def test_ai_backend_checks_real_frozen_model_path_before_any_child_process(context,settings):
     """Negative branch, no AI inference: changed model must fail before launch, not NameError."""
     session,factory,_,_,video=context;path,digest=source(context,settings)
