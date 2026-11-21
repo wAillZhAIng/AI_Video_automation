@@ -82,6 +82,7 @@ def _run(session, project_id):
 
 class ProductReferenceRetry(ShotProductReferencesEdit):
     expected_run_id: str = Field(min_length=1, max_length=64)
+    node_id: str = Field(min_length=1, max_length=128)
 
 
 class AssemblyRetry(BaseModel):

@@ -99,14 +99,18 @@ def test_default_quality_uses_fast_local_realesrgan_and_exact_ai_plan() -> None:
             assert path == "/api/quality/capabilities"
             return {"ai_plans": [{
                 "requested": {"resolution": "4k", "aspect_ratio": "16:9"},
+                "generation": {"width": 1024, "height": 576, "steps": 30},
                 "supported": True,
                 "ai_super_resolution": True,
                 "postprocess_model": {"name": "RealESRGAN_x4plus"},
-            }]}
+            }], "modes": {"fast": {"steps": 4}}}
 
     supported, evidence = launcher.quality_supported(FakeApi(), launcher.QUALITY)
     assert supported is True
     assert evidence["postprocess_model"]["name"] == "RealESRGAN_x4plus"
+    assert evidence["generation"]["steps"] == 4
+    assert evidence["requested_mode"] == "fast"
+    assert evidence["mode_steps_verified"] is True
 
 
 def test_quality_preflight_checks_only_the_selected_processing_plan() -> None:
@@ -156,6 +160,258 @@ def test_generation_preflight_requires_local_context_ir_and_exact_mode_steps() -
     assert launcher.generation_supported(FakeApi(healthy), quality)[0] is True
     assert launcher.generation_supported(FakeApi({**healthy, "ready": False}), quality)[0] is False
     assert launcher.generation_supported(FakeApi(healthy, steps=20), quality)[0] is False
+
+
+def test_generation_preflight_waits_for_transient_qwen_busy_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeApi:
+        def __init__(self): self.calls = 0
+        def get(self, path: str):
+            if path == "/api/providers/h3/context-health":
+                self.calls += 1
+                if self.calls == 1:
+                    return {"provider": "comfyui_h3_context_ir", "mode": "real", "ready": False,
+                        "reference_to_video_available": False, "busy": True, "busy_reason": "qwen"}
+                return {"provider": "comfyui_h3_context_ir", "mode": "real", "ready": True,
+                    "reference_to_video_available": True, "busy": False}
+            if path == "/api/quality/capabilities": return {"modes": {"fast": {"steps": 4}}}
+            raise AssertionError(path)
+    monkeypatch.setattr(launcher.time, "sleep", lambda _seconds: None)
+    api = FakeApi()
+    supported, evidence = launcher.generation_supported(api, {"mode": "fast"}, busy_wait_seconds=1)
+    assert supported is True
+    assert api.calls == 2
+    assert evidence["health"]["ready"] is True
+
+
+def test_unknown_import_reconciliation_only_replays_non_project_records() -> None:
+    class FakeApi:
+        def __init__(self, rows): self.rows = rows
+        def get(self, path: str):
+            assert path == "/api/word-imports"
+            return self.rows
+    digest = "a" * 64
+    safe = launcher.reconcile_import_by_sha(FakeApi([
+        {"id": "pending-1", "sha256": digest, "status": "pending_review"},
+    ]), digest)
+    assert safe["safe_to_replay"] is True
+    assert safe["records"] == [{"id": "pending-1", "status": "pending_review"}]
+    assert safe["import_id"] == "pending-1"
+
+    reused = launcher.reconcile_import_by_sha(FakeApi([
+        {"id": "complete-1", "sha256": digest, "status": "completed", "result_json": {"project_id": "project-1"}},
+    ]), digest)
+    assert reused["safe_to_replay"] is True
+    assert reused["project_id"] == "project-1"
+
+    unsafe = launcher.reconcile_import_by_sha(FakeApi([
+        {"id": "running-1", "sha256": digest, "status": "processing"},
+    ]), digest)
+    assert unsafe["safe_to_replay"] is False
+
+
+def test_crash_left_import_pending_ledger_is_reconciled_before_any_upload() -> None:
+    crash_left = {"status": "import_pending", "stage": "import_pending",
+        "script_sha256": "a" * 64, "project_id": None, "run_id": None}
+    assert launcher._is_unresolved_import(crash_left)
+    assert launcher._is_unresolved_import({**crash_left, "status": "unknown"})
+    assert not launcher._is_unresolved_import({**crash_left, "project_id": "project-1"})
+    assert not launcher._is_unresolved_import({**crash_left, "status": "started"})
+
+
+def test_definite_start_422_is_failure_and_can_reuse_existing_project_without_reimport() -> None:
+    previous = {"stage": "start_pending", "status": "unknown", "project_id": "project-1",
+        "product_id": "product-1", "image_ids": ["image-1"], "outcome_unknown": False,
+        "details": {"http_status": 422}}
+    error = launcher.WorkflowError("HTTP 422 rejected", phase="api", details={"http_status": 422})
+    assert launcher._definite_start_rejection(previous) is True
+    retry_record = {**previous, "stage": "start_pending_retry", "status": "failed"}
+    assert launcher._definite_start_rejection(retry_record) is True
+    assert launcher._definite_start_rejection({**retry_record, "outcome_unknown": True}) is False
+    assert launcher._failure_status(error, "start_pending") == "failed"
+    assert launcher._failure_status(launcher.WorkflowError("timeout", outcome_unknown=True), "start_pending") == "unknown"
+
+    class FakeApi:
+        def __init__(self): self.calls = []
+        def get(self, path: str):
+            self.calls.append(("GET", path))
+            return {"run": None, "shots": [{"id": "shot-1"}]}
+        def post_json(self, path: str, body):
+            self.calls.append(("POST", path, body))
+            return {"run": {"id": "run-1", "status": "queued"}}
+
+    api = FakeApi()
+    quality = {"resolution": "4k", "mode": "fast", "processing": "ai_super_resolution", "aspect_ratio": "9:16"}
+    result = launcher.retry_rejected_project_start(api, "project-1", quality, previous)
+    assert result["status"] == "started"
+    assert result["run_id"] == "run-1"
+    assert result["retried_rejected_start"] is True
+    assert [call[0] for call in api.calls] == ["GET", "GET", "POST"]
+    assert api.calls[2][2]["product_reference_plan"] == {
+        "product_id": "product-1", "image_ids": ["image-1"],
+        "selection_reason": "恢复已导入项目时沿用图库封面图作为商品身份锚点。"}
+    assert api.calls[2][2]["width"] == 576 and api.calls[2][2]["height"] == 1024
+
+
+def test_retry_product_reference_failures_changes_video_anchor_and_preserves_keyframe_selection() -> None:
+    product_error = "商品参考身份不一致或无法确定：<Picture 2> 无法唯一定位商品及独立操作者"
+    nodes = [
+        {"id": "video:shot-a", "kind": "video", "target_id": "shot-a", "status": "exception", "error": product_error},
+        {"id": "video:shot-b", "kind": "video", "target_id": "shot-b", "status": "failed", "error": product_error},
+        {"id": "quality:shot-a", "kind": "quality", "status": "waiting_dependencies", "error": None},
+    ]
+
+    class FakeApi:
+        def __init__(self, current_nodes): self.current_nodes = current_nodes; self.calls = []
+        def get(self, path):
+            self.calls.append(("GET", path))
+            if path.endswith("/references"):
+                return {"products": [{"product_id": "product-1", "revision": 7,
+                    "video_image_ids": ["cover-1", "detail-2"],
+                    "keyframe_image_ids": ["cover-1", "detail-2"],
+                    "images": [{"id": "cover-1"}, {"id": "detail-2"}]}]}
+            if path == "/api/product-library/product-1":
+                return {"id": "product-1", "cover_image_id": "cover-1", "images": [{"id": "cover-1"}]}
+            return {"run": {"id": "run-1", "status": "running", "nodes_json": self.current_nodes}}
+        def post_json(self, path, body):
+            self.calls.append(("POST", path, body))
+            return {"run": {"id": "run-1", "status": "queued", "nodes_json": [
+                {**nodes[0], "status": "pending"}, *nodes[1:]]}}
+
+    api = FakeApi(nodes)
+    result = launcher.retry_product_reference_failures(api, "project-1", "run-1")
+    assert result is not None
+    assert result["retried_product_reference_nodes"] == ["video:shot-a"]
+    assert result["product_reference_retry_run_id"] == "run-1"
+    post = next(call for call in api.calls if call[0] == "POST")
+    assert post[1] == "/api/studio/projects/project-1/retry-product-references"
+    assert post[2] == {"expected_run_id": "run-1", "node_id": "video:shot-a", "products": [{
+        "product_id": "product-1", "expected_revision": 7,
+        "video_image_ids": ["cover-1"], "keyframe_image_ids": ["cover-1", "detail-2"]}]}
+
+    active = FakeApi([*nodes, {"id": "video:shot-c", "kind": "video", "status": "running"}])
+    assert launcher.retry_product_reference_failures(active, "project-1", "run-1") is None
+    assert not any(call[0] == "POST" for call in active.calls)
+
+    other_error = FakeApi([{"id": "video:shot-x", "kind": "video", "status": "exception",
+        "error": "unrelated provider failure"}])
+    assert launcher.retry_product_reference_failures(other_error, "project-1", "run-1") is None
+    assert not any(call[0] == "POST" for call in other_error.calls)
+
+
+def test_retry_product_reference_failures_serializes_confirmed_failed_nodes() -> None:
+    nodes = [
+        {"id": "video:shot-a", "kind": "video", "target_id": "shot-a", "status": "exception",
+         "error": "商品参考身份不一致或无法确定"},
+        {"id": "video:shot-b", "kind": "video", "target_id": "shot-b", "status": "failed",
+         "error": "商品参考身份不一致或无法确定"},
+    ]
+
+    class FakeApi:
+        def __init__(self): self.nodes = [dict(node) for node in nodes]; self.calls = []
+        def get(self, path):
+            self.calls.append(("GET", path))
+            if path.endswith("/references"):
+                return {"products": [{"product_id": "product-1", "revision": 1,
+                    "video_image_ids": ["cover-1", "detail-2"], "keyframe_image_ids": ["cover-1", "detail-2"],
+                    "images": [{"id": "cover-1"}, {"id": "detail-2"}]}]}
+            if path == "/api/product-library/product-1":
+                return {"cover_image_id": "cover-1", "images": [{"id": "cover-1"}]}
+            return {"run": {"id": "run-1", "status": "running", "nodes_json": self.nodes}}
+        def post_json(self, path, body):
+            self.calls.append(("POST", path, body))
+            target = body["node_id"]
+            self.nodes = [{**node, "status": "succeeded" if node["id"] == target else node["status"]}
+                for node in self.nodes]
+            return {"run": {"id": "run-1", "status": "running", "nodes_json": self.nodes}}
+
+    api = FakeApi()
+    result = launcher.retry_product_reference_failures(api, "project-1", "run-1", wait=True,
+        poll_seconds=0, wait_seconds=5)
+    assert result is not None
+    assert result["retried_product_reference_nodes"] == ["video:shot-a", "video:shot-b"]
+    posts = [call for call in api.calls if call[0] == "POST"]
+    assert [call[2]["node_id"] for call in posts] == ["video:shot-a", "video:shot-b"]
+
+
+def test_ssh_tunnel_fingerprint_is_stable_and_recovers_exact_prior_ledger_entry(monkeypatch: pytest.MonkeyPatch,
+                                                                                 tmp_path: Path) -> None:
+    monkeypatch.setenv("VIDEO_FACTORY_API_ID", "vast-ssh://220.135.0.171:59748/127.0.0.1:18766")
+    assert launcher.api_fingerprint("http://127.0.0.1:49270") == "vast-ssh://220.135.0.171:59748/127.0.0.1:18766"
+    assert launcher.api_fingerprint("http://127.0.0.1:35119") == "vast-ssh://220.135.0.171:59748/127.0.0.1:18766"
+    image = launcher.ImageAsset(tmp_path / "product.png", "image-hash", 1, "image/png")
+    candidate = launcher.Candidate(tmp_path / "script.docx", "product/script.docx", "script-hash", 2,
+        "source text", images=[image])
+    quality = {"resolution": "4k", "mode": "fast", "processing": "ai_super_resolution", "aspect_ratio": "9:16"}
+    rows = {"old-port-key": {"script": candidate.relative_path, "script_sha256": candidate.sha256,
+        "image_sha256": [image.sha256], "quality": quality, "status": "unknown", "stage": "import_pending"}}
+    assert launcher.find_prior_candidate_entry(rows, candidate, quality) == ("old-port-key", rows["old-port-key"])
+
+
+def test_prior_entry_prefers_exact_existing_project_over_stale_preflight_and_rejects_duplicate_projects(tmp_path: Path) -> None:
+    image = launcher.ImageAsset(tmp_path / "product.png", "image-hash", 1, "image/png")
+    candidate = launcher.Candidate(tmp_path / "script.docx", "product/script.docx", "script-hash", 2,
+        "source text", images=[image])
+    quality = {"resolution": "4k", "mode": "fast", "processing": "ai_super_resolution", "aspect_ratio": "9:16"}
+    common = {"script": candidate.relative_path, "script_sha256": candidate.sha256,
+        "image_sha256": [image.sha256], "quality": quality}
+    stale = {**common, "status": "preflight_failed", "stage": "preflight", "updated_at": "2026-11-20T01:00:00Z"}
+    rejected = {**common, "status": "unknown", "stage": "start_pending", "project_id": "project-1",
+        "details": {"http_status": 422}, "updated_at": "2026-11-20T02:00:00Z"}
+    rows = {"stale-preflight": stale, "known-project": rejected}
+    assert launcher.find_prior_candidate_entry(rows, candidate, quality) == ("known-project", rejected)
+    with pytest.raises(launcher.WorkflowError, match="多条哈希相同记录"):
+        launcher.find_prior_candidate_entry({"project-1": rejected,
+            "project-2": {**rejected, "project_id": "project-2"}}, candidate, quality)
+
+
+def test_unknown_pending_review_import_is_reparsed_and_confirmed_without_reupload() -> None:
+    digest = "b" * 64
+    class FakeApi:
+        def __init__(self): self.calls = []
+        def get(self, path: str):
+            self.calls.append(("GET", path))
+            return {"id": "import-1", "sha256": digest, "status": "pending_review", "revision": 1}
+        def request(self, method: str, path: str, **kwargs):
+            self.calls.append((method, path))
+            assert method == "POST"
+            assert kwargs.get("body") is None
+            return {"id": "import-1", "sha256": digest, "status": "pending_review", "revision": 2, "issues": []}
+        def post_json(self, path: str, value):
+            self.calls.append(("POST_JSON", path, value))
+            return {"project_id": "project-1", "script_id": "script-1", "shot_ids": ["shot-1"]}
+    api = FakeApi()
+    row = launcher.resume_existing_import(api, "import-1", digest)
+    assert row["status"] == "imported"
+    assert row["project_id"] == "project-1"
+    assert row["shot_ids"] == ["shot-1"]
+    assert [call[:2] for call in api.calls] == [
+        ("GET", "/api/word-imports/import-1"),
+        ("POST", "/api/word-imports/import-1/retry?expected_revision=1"),
+        ("POST_JSON", "/api/word-imports/import-1/confirm"),
+    ]
+
+
+def test_unknown_pending_review_import_is_not_confirmed_when_hash_or_preview_is_invalid() -> None:
+    digest = "c" * 64
+    class FakeApi:
+        def __init__(self, actual_hash, issues): self.actual_hash, self.issues, self.writes = actual_hash, issues, []
+        def get(self, _path): return {"sha256": self.actual_hash, "status": "pending_review", "revision": 1}
+        def request(self, method, path, **kwargs):
+            self.writes.append((method, path))
+            return {"status": "pending_review", "revision": 2, "issues": self.issues}
+        def post_json(self, path, value):
+            self.writes.append(("POST_JSON", path))
+            return {}
+    wrong_hash = FakeApi("d" * 64, [])
+    with pytest.raises(launcher.WorkflowError, match="SHA-256"):
+        launcher.resume_existing_import(wrong_hash, "import-1", digest)
+    assert wrong_hash.writes == []
+
+    invalid_preview = FakeApi(digest, ["缺少有效镜头"])
+    with pytest.raises(launcher.WorkflowError, match="阻断问题"):
+        launcher.resume_existing_import(invalid_preview, "import-1", digest)
+    assert len(invalid_preview.writes) == 1
+    assert invalid_preview.writes[0][0] == "POST"
 
 
 def test_submit_candidate_blocks_before_word_import_when_context_ir_is_unready(tmp_path: Path) -> None:
